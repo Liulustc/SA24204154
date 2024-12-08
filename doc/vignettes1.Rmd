@@ -1,0 +1,311 @@
+---
+title: "SA24204154"
+author: "Lei Liu"
+date: "2024-12-08"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{SA24204154}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+## 背景
+
+在网络分析中，社区检测是一项关键任务，近年来受到国内外众多研究人员的关注。现在大多数社区检测都是基于二元网络模型，只考虑节点之间有无连边，忽略了边的权重信息。然而，加权网络在现实生活中更为普遍，因此网络的权重信息是极具价值的。这个R包的函数的主要思路就是，在加权网络上建立了加权随机块模型，再利用变分EM算法估计模型参数，进而得到加权网络的社区结构。
+
+## 加权随机块模型
+
+考虑邻接矩阵$\mathbf A$，$\mathbf A\in\mathcal{R}^{{n}\times{n}}$，$a_{ij}$代表节点$i$和节点$j$之间的相互作用，即节点间的边权重，WSBM模型下$a_{ij}$分布为
+\begin{align}
+	a_{ij} \sim \mathcal{N} (\mu_{c(i),c(j)},\sigma_{c(i),c(j)}^2), \label{model}
+\end{align} 
+其中$c\left(i\right)$和$c\left(j\right)$分别表示节点$i$和$j$的社区，$\mu_{c\left(i\right),c\left(j\right)}$和${\sigma^2}_{c\left(i\right),c\left(j\right)}$代表正态分布的均值和方差。可以看出，$a_{ij}$的分布只依赖于$i$和$j$的社区。
+
+$c\left(i\right)$服从多项分布，记$\mathbf{\alpha}=\left(\alpha_1,\ldots,\alpha_K\right)$，$\sum_{k=1}^{K}\alpha_k=1$，$c\left(i\right)$分布为
+\begin{align*}
+	c(i) \sim \mathcal{M} (1,\mathbf {\alpha}).
+\end{align*}   
+
+那么，下面的函数就展示了模拟生成一组符合模型的数据。
+
+## 模拟数据
+
+在生成模拟数据时，首先进行社区分配，社区向量服从多项分布，首先生成社区分配的参数，模拟社区分配。
+```{r}
+library(stats)
+library(MASS)
+simulation_alpha <- function(n, K) {
+  real_alpha <- rep(1 / K, K)
+  return(real_alpha)
+}
+simulation_c <- function(n, K, alpha) {
+  c <- sample(1:K, size = n, replace = TRUE, prob = alpha)
+  return(c)
+}
+```
+
+再生成均值和方差矩阵，利用$\mathbf\mu=(\mu_{kl})_{K\times K}$和$\mathbf\Sigma=(\sigma^2_{kl})_{K\times K}$都为对称矩阵，同时$\mu_{kl}\sim U\left(-d_m, d_m\right)$，$\sigma_{kl}^2=d_v^2$。
+```{r}
+simulation_mu <- function(n, K, dm) {
+  real_mu <- matrix(0, nrow = K, ncol = K)
+  for (i in seq(1, K)) {
+    real_mu[i, i] <- runif(1, -dm, dm)
+    for (j in seq(i+1, K)) {
+      if (j < (K+1)){
+        real_mu[i, j] <- runif(1, -dm, dm)
+        real_mu[j, i] <- real_mu[i, j]
+      }
+    }
+  }
+  return(real_mu)
+}
+
+simulation_sigma <- function(n, K, dv) {
+  real_sigma <- matrix(dv, nrow = K, ncol = K)
+  return(real_sigma)
+}
+```
+
+再根据节点的社区分配进行正态随机模拟生成权重矩阵。
+
+```{r}
+simulation_A <- function(n, mu, sigma, c) {
+  A <- matrix(0, nrow = n, ncol = n)
+  for (i in seq(1, n-1)) {
+    for (j in seq(i+1, n)) {
+      ith <- c[i]
+      jth <- c[j]
+      loc <- mu[ith, jth]
+      scale <- sqrt(sigma[ith, jth])
+      A[i, j] <- rnorm(1, mean = loc, sd = scale) + rnorm(1, mean = 0, sd = 0.1)
+      A[j, i] <- A[i, j]
+    }
+  }
+  return(A)
+}
+compute_Z <- function(n, K, c) {
+  Z <- matrix(0, nrow = n, ncol = K)
+  for (i in 1:n) {
+    Z[i, c[i]] <- 1
+  }
+  return(Z)
+}
+```
+
+具体来说，我们把利用上面的函数，生成了一组样本量$n$为1000，节点社区总个数K设置为4满足WSBM模型的数据集。
+
+下面函数输入为均值方差的生成参数，输出为模拟数据的真实社区分配概率，真实均值，方差，真实社区和邻接矩阵。
+```{r}
+real_ac <- function(dm, dv) {
+  set.seed(221)
+  n <- 1000
+  K <- 4
+  real_alpha <- simulation_alpha(n, K)
+  real_mu <- simulation_mu(n, K, dm)
+  real_sigma <- simulation_sigma(n, K, dv)
+  c <- simulation_c(n, K, real_alpha)
+  A <- simulation_A(n, real_mu, real_sigma, c)
+  list(
+    alpha = real_alpha,
+    mu = real_mu,
+    sigma = real_sigma,
+    c = c,
+    A = A
+  )
+}
+```
+
+举例子如下
+```{r}
+real <- real_ac(0.5, 0.5)
+head(real$c)
+```
+
+## 变分EM算法更新迭代参数
+
+$\mathbf{A}$的对数似然函数为
+\begin{align*}
+	\log{P}\left(\mathbf A\right)=\log{\left(\sum_{\mathbf Z} P\left(\mathbf A,\mathbf Z\right)\right)}.
+\end{align*}
+
+然而，$\mathbf Z$有$K^n$个可能值，所以直接对$\log{P}\left(\mathbf{A}\right)$进行最大似然估计是困难的。因此传统的EM算法无法直接应用求解最优$\log{P}\left(\mathbf{A}\right)$，下面我们采用变分EM算法来进行补救，考虑$\log{P}\left(\mathbf{A}\right)$的下界，并限制$\mathbf Z$的分布为因式分布来简化计算。
+
+具体来说，引入$\log{P}\left(\mathbf{A}\right)$的下界，$\mathbf \eta=(\mathbf\alpha,\mathbf \Theta)$，
+\begin{align}
+	\mathcal L(R_{\mathbf A}(\mathbf Z),\mathbf \eta)=\mathcal H(R_{\mathbf A}(\mathbf Z))+\sum_{\mathbf Z}R_{\mathbf A}(\mathbf Z)\log(P(\mathbf A,\mathbf Z;\mathbf \eta))
+\end{align}
+其中$R_{\mathbf A}(\mathbf Z)$表示$\mathbf Z$的一些分布，$\mathcal H(R_{\mathbf A}(\mathbf Z))$表示它的熵。$\mathcal L(R_{\mathbf A}(\mathbf Z),\mathbf \eta)$的最大值是$\log{P}\left(\mathbf{A}\right)$，在$R_{\mathbf A}(\mathbf Z)=P(\mathbf A\vert \mathbf Z)$时取得，也就是说上式是$\log{P}\left(\mathbf{A}\right)$的一个下界。
+
+下面为了简化计算，我们把$R_{\mathbf A}(\mathbf Z)$的分布限制为因式分解分布，记为$R_{\mathbf A}(\mathbf Z,\mathbf\tau)$，
+\begin{align}
+	R_{\mathbf A}(\mathbf Z,\mathbf\tau)=\Pi_{i=1}^n h(z_i,\mathbf \tau_i)
+\end{align}
+这里$h$表示多项分布函数，$ \mathbf \tau_i=( \tau_{i1},...,\tau_{ik})$是分布向量，满足$\mathbf \tau^T\mathbf{1_K}=\bm{1_n}$。由上式的最大值在 $R_{\mathbf{A}}(\mathbf{Z})=P(\mathbf{A}\vert \mathbf{Z})$ 时取得，那么 $\mathcal{L}(R_{\mathbf{A}}(\mathbf{Z},\mathbf{\tau}),\mathbf{\eta})\le\mathcal{L}(P(\mathbf{A}\vert \mathbf{Z}),\mathbf{\eta})$，不妨把$\mathcal{L}(R_{\mathbf{A}}(\mathbf{Z},\mathbf{\tau}),\mathbf{\eta})$ 简单记为$\mathcal{L}(\mathbf{\tau},\mathbf{\eta})$。此时记为
+\begin{align*}
+	\mathcal{L}(\mathbf{\tau},\mathbf{\eta})=\mathcal{H}(R_{\mathbf{A}}(\mathbf{Z}))+\sum_{\mathbf{Z}}R_{\mathbf{A}}(\mathbf{Z})\log(P(\mathbf{A},\mathbf{Z};\mathbf{\eta}))
+\end{align*}
+
+再利用求导和Lagrange乘子法来迭代更新参数，具体如下：
+
+1.初始化: $(\mathbf\alpha^{(0)},\mathbf\mu^{(0)},{\mathbf \Sigma}^{(0)},\mathbf \tau^{(0)})$，令$t=0$.
+
+2.${\alpha_{k}^{(t+1)}}=\frac 1n \sum_{i=1}^n\tau_{ik}^{(t)}$, $1\le k\le K$
+
+3.${\mu_{kl}}^{(t+1)}=\frac{\sum_{i\ne j}^n\tau_{ik}^{(t)}\tau_{jl}^{(t)}a_{ij}}{\sum_{i\ne j}^n\tau_{ik}^{(t)}\tau_{jl}^{(t)}}$, $1\le k,l \le K$
+
+4.{\sigma_{kl}^2}^{(t+1)}=\frac{\sum_{i\ne j}^n\tau_{ik}^{(t)}\tau_{jl}^{(t)}(a_{ij}-\mu_{kl}^{(t+1)})^2}{\sum_{i\ne j}^n\tau_{ik}^{(t)}\tau_{jl}^{(t)}}$, $1\le k,l \le K$
+
+5.$\tau_{ik}^{(t+1)} = \alpha_k^{(t+1)}\Pi_{j\ne i}^n\Pi_{l=1}^K[\frac{1}{\sqrt{2\pi{\sigma_{kl}^2}^{(t+1)}}}exp{\frac{(a_{ij}-\mu_{kl}^{(t+1)})^2}{-2{\sigma_{kl}^2}^{(t+1)}}}]^{\tau_{jl}^{(t)}}$, $1\le i \le n,1\le k \le K$
+
+6.再对$\tau_{ik}^{(t+1)}$进行归一化：$\tau_{ik}^{(t+1)}=\frac{\hat\tau_{ik}^{(t+1)}}{\sum_{k=1}^K \hat\tau_{ik}^{(t+1)}}$, $1\le i \le n,1\le k \le K$
+
+7.重复步骤2-6，直到收敛为止
+
+```{r}
+initial_alpha <- function(K) {
+  alpha <- rep(1 / K, K)
+  return(alpha)
+}
+
+initial_mu <- function(K) {
+  mu <- matrix(0, nrow = K, ncol = K)
+  return(mu)
+}
+
+initial_sigma <- function(K) {
+  sigma <- diag(K)
+  return(sigma)
+}
+
+initial_tau <- function(n, K) {
+  tau <- matrix(0, nrow = n, ncol = K)
+  for (i in 1:n) {
+    index <- sample(1:K, size = 1)
+    tau[i, index] <- 1
+    tau[i, ] <- tau[i, ] + 0.2
+  }
+  initial_tau <- t(apply(tau, 1, function(x) x / sum(x)))
+  return(initial_tau)
+}
+
+update_alpha <- function(K, tau) {
+  alpha <- colMeans(tau)
+  return(alpha)
+}
+
+update_mu <- function(n, K, tau, A) {
+  mu <- matrix(0, nrow = K, ncol = K)
+  for (k in 1:K) {
+    for (l in 1:K) {
+      sum_mu1 <- tau[, k] %*% t(tau[, l]) * A
+      sum_mu2 <- tau[, k] %*% t(tau[, l])
+      mu[k, l] <- (sum(sum_mu1) - sum(diag(sum_mu1))) / (sum(sum_mu2) - sum(diag(sum_mu2)))
+    }
+  }
+  return(mu)
+}
+
+update_sigma <- function(n, K, tau, A, mu) {
+  sigma <- matrix(0, nrow = K, ncol = K)
+  for (k in 1:K) {
+    for (l in 1:K) {
+      diff <- A - matrix(mu[k, l], nrow = n, ncol = n)
+      sum_sigma1 <- tau[, k] %*% t(tau[, l]) * diff^2
+      sum_sigma2 <- tau[, k] %*% t(tau[, l])
+      sigma[k, l] <- (sum(sum_sigma1) - sum(diag(sum_sigma1))) / (sum(sum_sigma2) - sum(diag(sum_sigma2)))
+    }
+  }
+  return(sigma)
+}
+
+update_tau <- function(n, K, tau, A, alpha, mu, sigma) {
+  for (i in 1:n) {
+    ratio <- numeric(K)
+    mini_ratio <- numeric(K)
+    for (k in 1:K) {
+      temp <- 2 * pi * sigma[k, ]^(-0.5)
+      temp1 <- (A[i, ] - mu[k, ])^2 / (-2 * sigma[k, ])
+      temp <- temp * exp(temp1)
+      temp <- temp^tau
+      mini_temp <- temp^(1 / 100)
+      mini_alpha <- alpha^(1 / 100)
+      mini_ratio[k] <- mini_alpha[k] * prod(mini_temp)
+    }
+    mini_sum <- sum(mini_ratio)
+    ratio <- (mini_ratio / mini_sum)^100
+    tau[i, ] <- ratio / sum(ratio)
+  }
+  return(tau)
+}
+get_es_c <- function(n, tau) {
+  es_c <- max.col(tau)
+  return(es_c)
+}
+```
+
+具体来说，我们的main函数输入待估矩阵，经过逐步迭代输出估计的社区。
+```{r}
+main <- function(real) {
+  n <- 1000
+  K <- 4
+  c <- real$c
+  A <- real$A
+  alpha <- initial_alpha(K)
+  mu <- initial_mu(K)
+  sigma <- initial_sigma(K)
+  tau <- initial_tau(n, K)
+  for (w in 1:5) {
+    alpha <- update_alpha(K, tau)
+    mu <- update_mu(n, K, tau, A)
+    sigma <- update_sigma(n, K, tau, A, mu)
+    tau <- update_tau(n, K, tau, A, alpha, mu, sigma)
+  }
+  es_c <- get_es_c(n, tau)
+  return(es_c)
+}
+```
+
+## 计算错误率
+
+不同方法的社区检测性能由聚类不稳定性来评估，定义为
+\begin{align*}
+	error(c, \hat{c})= \frac{2}{n(n-1)}\sum_{i<j}(I\big(\hat{c} (i)=\hat{c}(j),{c} (i)\neq {c}(j)\big)+I\big(c(i)=c(j),\hat{c} (i)\neq \hat{c}(j)\big) ),
+\end{align*}
+这里的$I(\cdot)$为示性函数，$\{c(1),...,c(n)\}$和$\{\hat c(1),...,\hat c(n)\}$分别指$n$个节点真实的社区标签和估计的社区标签。可以看出，$error(c, \hat{c})$衡量的是在社区分配下，$c$和$\hat c$出现分歧的概率，也考虑到了$\hat c$中社区标签置换的情况，在置换下不变。这样定义是直观且合理的，具体来说，若节点$i$和节点$j$在$c$下被分为一组，但是在$\hat c$下未被分为一组，或者节点$i$和节点$j$在$c$下未被分为一组，但是在$\hat c$下被分为一组，即$c$和$\hat c$出现分歧，那么就记为一组错分，用累计错分的组数除以所有的节点组数就得到了$error(c, \hat{c})$。
+
+我们编写了Rcpp函数来表示这一过程
+```{r}
+library(Rcpp)
+cppFunction('double error(int n, IntegerVector c, IntegerVector es_c) {
+  int error1 = 0;
+  int error2 = 0;
+  for (int j = 0; j < n; j++) {
+    for (int i = 0; i < j; i++) {
+      if ((c[i] == c[j]) && (es_c[i] != es_c[j])) {
+        error1++;
+      }
+      if ((c[i] != c[j]) && (es_c[i] == es_c[j])) {
+        error2++;
+      }
+    }
+  }
+  return 2.0 * (error1 + error2) / (n * (n - 1));
+}')
+```
+
+举例子
+```{r}
+c <- c(1, 1, 2, 2, 3, 3)
+esc <- c(1, 1, 2, 3, 2, 3)
+result <- error(6, c, esc)
+print(result)
+```
+
+因此，我们可以看一个例子，在main函数里输入我们刚刚模拟生成的矩阵数据real，接着计算出估计的额错误率。
+```{r}
+c <- real$c
+esc <- main(real)
+error(1000, c, esc)
+```
+
+
+
