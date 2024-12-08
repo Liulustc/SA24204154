@@ -1,0 +1,15 @@
+Package: SA24204154
+Type: Package
+Title: Community Detection on Weighted Networks
+Version: 0.1.0
+Author: Lei Liu
+Maintainer: Lei Liu <ll0726@mail.ustc.edu.cn>
+Description: We build a weighted stochastic block model on weighted networks, use the variational EM algorithm to estimate the model parameters, and then obtain the community structure of weighted networks.  
+LazyData: true
+License: GPL (>= 2)
+Imports: Rcpp, MASS, stats, boot, bootstrap, DAAG, coda, ggplot2, pracma, lpSolve, microbenchmark
+Suggests: knitr, rmarkdown
+LinkingTo: Rcpp
+RoxygenNote: 7.3.2
+Encoding: UTF-8
+VignetteBuilder: knitr
